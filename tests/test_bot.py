@@ -14,11 +14,55 @@ import data
 
 @pytest.fixture
 def app(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "test-webhook-secret")
     monkeypatch.setitem(sys.modules, "token_api", SimpleNamespace(token="123456:test-token"))
     sys.modules.pop("main", None)
     module = importlib.import_module("main")
     monkeypatch.setattr(module, "bot", Mock())
     return module
+
+
+def test_health(app):
+    assert app.app.test_client().get("/").status_code == 200
+
+
+def test_webhook_requires_config(app, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET")
+    client = app.app.test_client()
+    assert client.get("/").status_code == 503
+    assert client.post("/webhook", json={"update_id": 1}).status_code == 503
+    app.bot.process_new_updates.assert_not_called()
+
+
+def test_webhook_rejects_untrusted_requests(app):
+    client = app.app.test_client()
+    assert client.post("/webhook", json={"update_id": 1}).status_code == 403
+    assert client.post("/webhook", json={"update_id": 1}, headers={
+        "X-Telegram-Bot-Api-Secret-Token": "wrong-secret"
+    }).status_code == 403
+    app.bot.process_new_updates.assert_not_called()
+
+
+def test_webhook_processes_update(app):
+    response = app.app.test_client().post(
+        "/webhook", json={"update_id": 123},
+        headers={"X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret"},
+    )
+    assert response.status_code == 200
+    assert response.json == {"ok": True}
+    app.bot.process_new_updates.assert_called_once()
+    assert app.bot.process_new_updates.call_args.args[0][0].update_id == 123
+
+
+@pytest.mark.parametrize("payload", [[], {}, {"update_id": "invalid"}])
+def test_webhook_rejects_invalid_update(app, payload):
+    response = app.app.test_client().post(
+        "/webhook", json=payload,
+        headers={"X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret"},
+    )
+    assert response.status_code == 400
+    app.bot.process_new_updates.assert_not_called()
 
 
 @pytest.fixture

@@ -1,25 +1,64 @@
 """Telegram menu for dollar and euro price charts."""
 
 import logging
+import os
+import secrets
 from io import BytesIO
 from threading import Lock
 
 import pandas as pd
 import requests
+from flask import Flask, abort, request
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import StrMethodFormatter
 from telebot import TeleBot, types
 
 from data import get_history
-from token_api import token
+token = os.environ.get("TELEGRAM_BOT_TOKEN")
+if not token:
+    try:
+        from token_api import token
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Set TELEGRAM_BOT_TOKEN in the deployment environment") from exc
 
 USD_BUTTON = "نمودار 3 ماه اخیر دلار"
 EUR_BUTTON = "نمودار 3 ماه اخیر یورو"
 CURRENCIES = {USD_BUTTON: ("USD", "دلار"), EUR_BUTTON: ("EUR", "یورو")}
 chart_lock = Lock()
 logger = logging.getLogger(__name__)
-bot = TeleBot(token)
+# Complete handlers before replying to webhook requests in serverless runtimes.
+bot = TeleBot(token, threaded=False)
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
+
+
+@app.get("/")
+def health() -> tuple[dict[str, str], int]:
+    """Report application readiness without contacting Telegram."""
+    if not os.environ.get("TELEGRAM_WEBHOOK_SECRET"):
+        return {"status": "missing_webhook_secret"}, 503
+    return {"status": "ok"}, 200
+
+
+@app.post("/webhook")
+def webhook() -> tuple[dict[str, bool], int]:
+    """Accept authenticated Telegram updates and process them synchronously."""
+    expected = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+    supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not expected:
+        abort(503)
+    if not secrets.compare_digest(supplied, expected):
+        abort(403)
+    payload = request.get_json()
+    if not isinstance(payload, dict) or not isinstance(payload.get("update_id"), int):
+        abort(400)
+    try:
+        update = types.Update.de_json(payload)
+    except (ValueError, TypeError, KeyError):
+        abort(400)
+    bot.process_new_updates([update])
+    return {"ok": True}, 200
 
 
 def menu() -> types.ReplyKeyboardMarkup:
